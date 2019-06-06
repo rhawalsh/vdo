@@ -135,10 +135,12 @@ int parseIndexConfig(UdsConfigStrings *configStrings,
 
   config.mem = UDS_MEMORY_CONFIG_256MB;
   if (configStrings->memorySize != NULL) {
-    int result = parseMem(configStrings->memorySize, &config.mem);
+    uint32_t mem;
+    int result = parseMem(configStrings->memorySize, &mem);
     if (result != UDS_SUCCESS) {
       return result;
     }
+    config.mem = mem;
   }
 
   if (configStrings->checkpointFrequency != NULL) {

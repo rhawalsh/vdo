@@ -50,12 +50,12 @@ typedef struct {
 } __attribute__((packed)) BlockMapState2_0;
 
 static const Header BLOCK_MAP_HEADER_2_0 = {
-  .id                                    = BLOCK_MAP,
-  .version                               = {
-    .majorVersion                        = 2,
-    .minorVersion                        = 0,
+  .id             = BLOCK_MAP,
+  .version        = {
+    .majorVersion = 2,
+    .minorVersion = 0,
   },
-  .size                                  = sizeof(BlockMapState2_0),
+  .size           = sizeof(BlockMapState2_0),
 };
 
 /**
@@ -70,7 +70,7 @@ typedef struct {
    * the reference on the old value must be released and a reference on the
    * new value must be acquired.
    **/
-  SequenceNumber                                                    recoveryLock;
+  SequenceNumber recoveryLock;
 } BlockMapPageContext;
 
 /**
@@ -145,7 +145,7 @@ int makeBlockMap(BlockCount            logicalBlocks,
                     / sizeof(BlockMapEntry)));
 
   BlockMap *map;
-  int       result = ALLOCATE_EXTENDED(BlockMap, threadConfig->logicalZoneCount,
+  int result = ALLOCATE_EXTENDED(BlockMap, threadConfig->logicalZoneCount,
                                  BlockMapZone, __func__, &map);
   if (result != UDS_SUCCESS) {
     return result;
@@ -181,27 +181,38 @@ static int decodeBlockMapState_2_0(Buffer *buffer, BlockMapState2_0 *state)
 {
   size_t initialLength = contentLength(buffer);
 
-  int result = getUInt64LEFromBuffer(buffer, &state->flatPageOrigin);
+  PhysicalBlockNumber flatPageOrigin;
+  int result = getUInt64LEFromBuffer(buffer, &flatPageOrigin);
   if (result != UDS_SUCCESS) {
     return result;
   }
 
-  result = getUInt64LEFromBuffer(buffer, &state->flatPageCount);
+  BlockCount flatPageCount;
+  result = getUInt64LEFromBuffer(buffer, &flatPageCount);
   if (result != UDS_SUCCESS) {
     return result;
   }
 
-  result = getUInt64LEFromBuffer(buffer, &state->rootOrigin);
+  PhysicalBlockNumber rootOrigin;
+  result = getUInt64LEFromBuffer(buffer, &rootOrigin);
   if (result != UDS_SUCCESS) {
     return result;
   }
 
-  result = getUInt64LEFromBuffer(buffer, &state->rootCount);
+  BlockCount rootCount;
+  result = getUInt64LEFromBuffer(buffer, &rootCount);
   if (result != UDS_SUCCESS) {
     return result;
   }
 
-  size_t decodedSize                       = initialLength - contentLength(buffer);
+  *state = (BlockMapState2_0) {
+    .flatPageOrigin = flatPageOrigin,
+    .flatPageCount  = flatPageCount,
+    .rootOrigin     = rootOrigin,
+    .rootCount      = rootCount,
+  };
+
+  size_t decodedSize = initialLength - contentLength(buffer);
   return ASSERT(BLOCK_MAP_HEADER_2_0.size == decodedSize,
                 "decoded block map component size must match header size");
 }
@@ -304,6 +315,49 @@ static ThreadID getBlockMapZoneThreadID(void *context, ZoneCount zoneNumber)
   return getBlockMapZone(context, zoneNumber)->threadID;
 }
 
+/**
+ * Prepare for an era advance.
+ *
+ * <p>Implements ActionPreamble.
+ **/
+static void prepareForEraAdvance(void *context, VDOCompletion *parent)
+{
+  BlockMap *map = context;
+  map->currentEraPoint = map->pendingEraPoint;
+  completeCompletion(parent);
+}
+
+/**
+ * Update the progress of the era in a zone.
+ *
+ * <p>Implements ZoneAction.
+ **/
+static void advanceBlockMapZoneEra(void          *context,
+                                   ZoneCount      zoneNumber,
+                                   VDOCompletion *parent)
+{
+  BlockMapZone *zone = getBlockMapZone(context, zoneNumber);
+  advanceVDOPageCachePeriod(zone->pageCache, zone->blockMap->currentEraPoint);
+  advanceZoneTreePeriod(&zone->treeZone, zone->blockMap->currentEraPoint);
+  finishCompletion(parent, VDO_SUCCESS);
+}
+
+/**
+ * Schedule an era advance if necessary.
+ *
+ * <p>Implements ActionScheduler.
+ **/
+static bool scheduleEraAdvance(void *context)
+{
+  BlockMap *map = context;
+  if (map->currentEraPoint == map->pendingEraPoint) {
+    return false;
+  }
+
+  return scheduleAction(map->actionManager, prepareForEraAdvance,
+                        advanceBlockMapZoneEra, NULL, NULL);
+}
+
 /**********************************************************************/
 int makeBlockMapCaches(BlockMap         *map,
                        PhysicalLayer    *layer,
@@ -336,7 +390,8 @@ int makeBlockMapCaches(BlockMap         *map,
   }
 
   return makeActionManager(map->zoneCount, getBlockMapZoneThreadID,
-                           getRecoveryJournalThreadID(journal), map, layer,
+                           getRecoveryJournalThreadID(journal), map,
+                           scheduleEraAdvance, layer,
                            &map->actionManager);
 }
 
@@ -407,7 +462,7 @@ int encodeBlockMap(const BlockMap *map, Buffer *buffer)
     return result;
   }
 
-  size_t encodedSize                       = contentLength(buffer) - initialLength;
+  size_t encodedSize = contentLength(buffer) - initialLength;
   return ASSERT(BLOCK_MAP_HEADER_2_0.size == encodedSize,
                 "encoded block map component size must match header size");
 }
@@ -417,7 +472,6 @@ void initializeBlockMapFromJournal(BlockMap *map, RecoveryJournal *journal)
 {
   map->currentEraPoint  = getCurrentJournalSequenceNumber(journal);
   map->pendingEraPoint  = map->currentEraPoint;
-  map->previousEraPoint = map->currentEraPoint;
 
   for (ZoneCount zone = 0; zone < map->zoneCount; zone++) {
     setTreeZoneInitialPeriod(&map->zones[zone].treeZone, map->currentEraPoint);
@@ -474,48 +528,6 @@ BlockCount getNumberOfBlockMapEntries(const BlockMap *map)
   return map->entryCount;
 }
 
-/**
- * Now that an action has been applied to all zones, see if there are more
- * actions to do.
- *
- * <p>Implements ActionConclusion
- **/
-static void finishActing(void *context)
-{
-  BlockMap *map = context;
-  if (!hasNextAction(map->actionManager)) {
-    advanceBlockMapEra(map, map->pendingEraPoint);
-  }
-}
-
-/**
- * Finish advancing the era now that all the zones have been notified.
- *
- * <p>Implements ActionConclusion
- **/
-static void finishAging(void *context)
-{
-  BlockMap *map         = context;
-  map->previousEraPoint = map->currentEraPoint;
-  map->aging            = false;
-  finishActing(context);
-}
-
-/**
- * Update the progress of the era in a zone.
- *
- * <p>Implements ZoneAction
- **/
-static void advanceBlockMapZoneEra(void          *context,
-                                   ZoneCount      zoneNumber,
-                                   VDOCompletion *parent)
-{
-  BlockMapZone *zone = getBlockMapZone(context, zoneNumber);
-  advanceVDOPageCachePeriod(zone->pageCache, zone->blockMap->currentEraPoint);
-  advanceZoneTreePeriod(&zone->treeZone, zone->blockMap->currentEraPoint);
-  finishCompletion(parent, VDO_SUCCESS);
-}
-
 /**********************************************************************/
 void advanceBlockMapEra(BlockMap *map, SequenceNumber recoveryBlockNumber)
 {
@@ -524,26 +536,7 @@ void advanceBlockMapEra(BlockMap *map, SequenceNumber recoveryBlockNumber)
   }
 
   map->pendingEraPoint = recoveryBlockNumber;
-  if (map->aging || (map->currentEraPoint == map->pendingEraPoint)) {
-    return;
-  }
-
-  map->currentEraPoint = map->pendingEraPoint;
-  map->aging           = true;
-  scheduleAction(map->actionManager, advanceBlockMapZoneEra, finishAging,
-                 NULL);
-}
-
-/**
- * Finish a drain action.
- *
- * <p>Implements ActionConclusion.
- **/
-static void finishBlockMapDrain(void *context)
-{
-  BlockMap *map = context;
-  finishDraining(&map->state);
-  finishActing(map);
+  scheduleEraAdvance(map);
 }
 
 /**
@@ -557,7 +550,9 @@ static void drainZone(void          *context,
 {
   BlockMap     *map  = (BlockMap *) context;
   BlockMapZone *zone = getBlockMapZone(context, zoneNumber);
-  if (startDraining(&zone->adminState, map->state.state, parent)) {
+  if (startDraining(&zone->adminState,
+                    getCurrentManagerOperation(map->actionManager),
+                    parent)) {
     drainZoneTrees(&zone->treeZone);
   }
 }
@@ -567,21 +562,8 @@ void drainBlockMap(BlockMap       *map,
                    AdminStateCode  operation,
                    VDOCompletion  *parent)
 {
-  if (startDraining(&map->state, operation, parent)) {
-    scheduleAction(map->actionManager, drainZone, finishBlockMapDrain, NULL);
-  }
-}
-
-/**
- * Finish a resume action.
- *
- * <p>Implements ActionConclusion.
- **/
-static void finishBlockMapResume(void *context)
-{
-  BlockMap *map = context;
-  resumeIfQuiescent(&map->state);
-  finishActing(map);
+  scheduleOperation(map->actionManager, operation, NULL, drainZone, NULL,
+                    parent);
 }
 
 /**
@@ -593,20 +575,17 @@ static void resumeBlockMapZone(void          *context,
                                ZoneCount      zoneNumber,
                                VDOCompletion *parent)
 {
-  resumeIfQuiescent(&(getBlockMapZone(context, zoneNumber)->adminState));
-  completeCompletion(parent);
+  BlockMapZone *zone = getBlockMapZone(context, zoneNumber);
+  finishCompletion(parent,
+                   (resumeIfQuiescent(&zone->adminState)
+                    ? VDO_SUCCESS : VDO_INVALID_ADMIN_STATE));
 }
 
 /**********************************************************************/
 void resumeBlockMap(BlockMap *map, VDOCompletion *parent)
 {
-  if (!isQuiescent(&map->state)) {
-    finishCompletion(parent, VDO_INVALID_ADMIN_STATE);
-    return;
-  }
-
-  scheduleAction(map->actionManager, resumeBlockMapZone, finishBlockMapResume,
-                 parent);
+  scheduleOperation(map->actionManager, ADMIN_STATE_RESUMING, NULL,
+                    resumeBlockMapZone, NULL, parent);
 }
 
 /**********************************************************************/
@@ -637,7 +616,8 @@ BlockCount getNewEntryCount(BlockMap *map)
 /**********************************************************************/
 void growBlockMap(BlockMap *map)
 {
-  ASSERT_LOG_ONLY(isQuiescent(&map->state),
+  AdminStateCode code = getCurrentManagerOperation(map->actionManager);
+  ASSERT_LOG_ONLY(isQuiescentCode(code),
                   "growBlockMap() called on quiescent block map");
 
   replaceForest(map);

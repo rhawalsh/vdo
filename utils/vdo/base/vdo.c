@@ -102,7 +102,7 @@ int allocateVDO(PhysicalLayer *layer, VDO **vdoPtr)
 
   vdo->layer = layer;
   if (layer->createEnqueueable != NULL) {
-    result = makeAdminCompletion(layer, &vdo->adminCompletion);
+    result = initializeAdminCompletion(vdo, &vdo->adminCompletion);
     if (result != VDO_SUCCESS) {
       freeVDO(&vdo);
       return result;
@@ -152,13 +152,7 @@ void destroyVDO(VDO *vdo)
   FREE(vdo->hashZones);
   vdo->hashZones = NULL;
 
-  if (vdo->logicalZones != NULL) {
-    for (ZoneCount zone = 0; zone < threadConfig->logicalZoneCount; zone++) {
-      freeLogicalZone(&vdo->logicalZones[zone]);
-    }
-  }
-  FREE(vdo->logicalZones);
-  vdo->logicalZones = NULL;
+  freeLogicalZones(&vdo->logicalZones);
 
   if (vdo->physicalZones != NULL) {
     for (ZoneCount zone = 0; zone < threadConfig->physicalZoneCount; zone++) {
@@ -168,7 +162,7 @@ void destroyVDO(VDO *vdo)
   FREE(vdo->physicalZones);
   vdo->physicalZones = NULL;
 
-  freeAdminCompletion(&vdo->adminCompletion);
+  uninitializeAdminCompletion(&vdo->adminCompletion);
   freeReadOnlyNotifier(&vdo->readOnlyNotifier);
   freeThreadConfig(&vdo->loadConfig.threadConfig);
 }
@@ -438,27 +432,44 @@ int validateVDOVersion(VDO *vdo)
 __attribute__((warn_unused_result))
 static int decodeVDOConfig(Buffer *buffer, VDOConfig *config)
 {
-  int result = getUInt64LEFromBuffer(buffer, &config->logicalBlocks);
+  BlockCount logicalBlocks;
+  int result = getUInt64LEFromBuffer(buffer, &logicalBlocks);
   if (result != VDO_SUCCESS) {
     return result;
   }
 
-  result = getUInt64LEFromBuffer(buffer, &config->physicalBlocks);
+  BlockCount physicalBlocks;
+  result = getUInt64LEFromBuffer(buffer, &physicalBlocks);
   if (result != VDO_SUCCESS) {
     return result;
   }
 
-  result = getUInt64LEFromBuffer(buffer, &config->slabSize);
+  BlockCount slabSize;
+  result = getUInt64LEFromBuffer(buffer, &slabSize);
   if (result != VDO_SUCCESS) {
     return result;
   }
 
-  result = getUInt64LEFromBuffer(buffer, &config->recoveryJournalSize);
+  BlockCount recoveryJournalSize;
+  result = getUInt64LEFromBuffer(buffer, &recoveryJournalSize);
   if (result != VDO_SUCCESS) {
     return result;
   }
 
-  return getUInt64LEFromBuffer(buffer, &config->slabJournalBlocks);
+  BlockCount slabJournalBlocks;
+  result = getUInt64LEFromBuffer(buffer, &slabJournalBlocks);
+  if (result != VDO_SUCCESS) {
+    return result;
+  }
+
+  *config = (VDOConfig) {
+    .logicalBlocks       = logicalBlocks,
+    .physicalBlocks      = physicalBlocks,
+    .slabSize            = slabSize,
+    .recoveryJournalSize = recoveryJournalSize,
+    .slabJournalBlocks   = slabJournalBlocks,
+  };
+  return VDO_SUCCESS;
 }
 
 /**
@@ -474,30 +485,43 @@ __attribute__((warn_unused_result))
 {
   size_t initialLength = contentLength(buffer);
 
-  int result = getUInt32LEFromBuffer(buffer, &state->state);
+  VDOState vdoState;
+  int result = getUInt32LEFromBuffer(buffer, &vdoState);
   if (result != VDO_SUCCESS) {
     return result;
   }
 
-  result = getUInt64LEFromBuffer(buffer, &state->completeRecoveries);
+  uint64_t completeRecoveries;
+  result = getUInt64LEFromBuffer(buffer, &completeRecoveries);
   if (result != VDO_SUCCESS) {
     return result;
   }
 
-  result = getUInt64LEFromBuffer(buffer, &state->readOnlyRecoveries);
+  uint64_t readOnlyRecoveries;
+  result = getUInt64LEFromBuffer(buffer, &readOnlyRecoveries);
   if (result != VDO_SUCCESS) {
     return result;
   }
 
-  result = decodeVDOConfig(buffer, &state->config);
+  VDOConfig config;
+  result = decodeVDOConfig(buffer, &config);
   if (result != VDO_SUCCESS) {
     return result;
   }
 
-  result = getUInt64LEFromBuffer(buffer, &state->nonce);
+  Nonce nonce;
+  result = getUInt64LEFromBuffer(buffer, &nonce);
   if (result != VDO_SUCCESS) {
     return result;
   }
+
+  *state = (VDOComponent41_0) {
+    .state              = vdoState,
+    .completeRecoveries = completeRecoveries,
+    .readOnlyRecoveries = readOnlyRecoveries,
+    .config             = config,
+    .nonce              = nonce,
+  };
 
   size_t decodedSize = initialLength - contentLength(buffer);
   return ASSERT(decodedSize == sizeof(VDOComponent41_0),
@@ -744,7 +768,7 @@ void leaveRecoveryMode(VDO *vdo)
    * Since scrubbing can be stopped by vdoClose during recovery mode,
    * do not change the VDO state if there are outstanding unrecovered slabs.
    */
-  if (vdo->closeRequested || inReadOnlyMode(vdo)) {
+  if (inReadOnlyMode(vdo)) {
     return;
   }
 
@@ -784,28 +808,6 @@ bool getVDOCompressing(VDO *vdo)
 static size_t getBlockMapCacheSize(const VDO *vdo)
 {
   return ((size_t) vdo->loadConfig.cacheSize) * VDO_BLOCK_SIZE;
-}
-
-/**
- * Return a user-visible string describing the current VDO state.
- *
- * @param state  The VDO state to describe
- *
- * @return A string constant describing the state
- **/
-static const char *describeVDOState(VDOState state)
-{
-  // These strings should all fit in the 15 chars of VDOStatistics.mode.
-  switch (state) {
-  case VDO_RECOVERING:
-    return "recovering";
-
-  case VDO_READ_ONLY_MODE:
-    return "read-only";
-
-  default:
-    return "normal";
-  }
 }
 
 /**
@@ -997,7 +999,7 @@ void dumpVDOStatus(const VDO *vdo)
 
   const ThreadConfig *threadConfig = getThreadConfig(vdo);
   for (ZoneCount zone = 0; zone < threadConfig->logicalZoneCount; zone++) {
-    dumpLogicalZone(vdo->logicalZones[zone]);
+    dumpLogicalZone(getLogicalZone(vdo->logicalZones, zone));
   }
 
   for (ZoneCount zone = 0; zone < threadConfig->physicalZoneCount; zone++) {
@@ -1037,6 +1039,17 @@ void assertOnLogicalZoneThread(const VDO  *vdo,
   ASSERT_LOG_ONLY((getCallbackThreadID()
                    == getLogicalZoneThread(getThreadConfig(vdo), logicalZone)),
                   "%s called on logical thread", name);
+}
+
+/**********************************************************************/
+void assertOnPhysicalZoneThread(const VDO  *vdo,
+                                ZoneCount   physicalZone,
+                                const char *name)
+{
+  ASSERT_LOG_ONLY((getCallbackThreadID()
+                   == getPhysicalZoneThread(getThreadConfig(vdo),
+                                            physicalZone)),
+                  "%s called on physical thread", name);
 }
 
 /**********************************************************************/

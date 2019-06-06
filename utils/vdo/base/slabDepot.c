@@ -25,6 +25,7 @@
 #include "memoryAlloc.h"
 
 #include "actionManager.h"
+#include "adminState.h"
 #include "blockAllocatorInternals.h"
 #include "constants.h"
 #include "header.h"
@@ -32,10 +33,8 @@
 #include "readOnlyNotifier.h"
 #include "refCounts.h"
 #include "slab.h"
-#include "slabCompletion.h"
 #include "slabDepotInternals.h"
 #include "slabJournal.h"
-#include "slabJournalEraser.h"
 #include "slabIterator.h"
 #include "slabSummary.h"
 #include "threadConfig.h"
@@ -101,15 +100,12 @@ static SlabIterator getSlabIterator(SlabDepot *depot)
  * allocators.
  *
  * @param depot      The depot
- * @param layer      The layer to use
  * @param slabCount  The number of slabs the depot should have in the new
  *                   array
  *
  * @return VDO_SUCCESS or an error code
  **/
-static int allocateSlabs(SlabDepot     *depot,
-                         PhysicalLayer *layer,
-                         SlabCount      slabCount)
+static int allocateSlabs(SlabDepot *depot, SlabCount slabCount)
 {
   int result = ALLOCATE(slabCount, Slab *, "slab pointer array",
                         &depot->newSlabs);
@@ -135,7 +131,7 @@ static int allocateSlabs(SlabDepot     *depot,
       = depot->allocators[depot->newSlabCount % depot->zoneCount];
     Slab **slabPtr = &depot->newSlabs[depot->newSlabCount];
     result = makeSlab(slabOrigin, allocator, translation, depot->journal,
-                      layer, depot->newSlabCount, slabPtr);
+                      depot->newSlabCount, slabPtr);
     if (result != VDO_SUCCESS) {
       return result;
     }
@@ -145,7 +141,7 @@ static int allocateSlabs(SlabDepot     *depot,
     slabOrigin += slabSize;
 
     if (resizing) {
-      result = allocateRefCountsForSlab(layer, *slabPtr);
+      result = allocateRefCountsForSlab(*slabPtr);
       if (result != VDO_SUCCESS) {
         return result;
       }
@@ -177,6 +173,34 @@ void abandonNewSlabs(SlabDepot *depot)
 static ThreadID getAllocatorThreadID(void *context, ZoneCount zoneNumber)
 {
   return getBlockAllocatorForZone(context, zoneNumber)->threadID;
+}
+
+/**
+ * Prepare to commit oldest tail blocks.
+ *
+ * <p>Implements ActionPreamble.
+ **/
+static void prepareForTailBlockCommit(void *context, VDOCompletion *parent)
+{
+  SlabDepot *depot = context;
+  depot->activeReleaseRequest = depot->newReleaseRequest;
+  completeCompletion(parent);
+}
+
+/**
+ * Schedule a tail block commit if necessary.
+ *
+ * <p>Implements ActionScheduler,
+ **/
+static bool scheduleTailBlockCommit(void *context)
+{
+  SlabDepot *depot = context;
+  if (depot->newReleaseRequest == depot->activeReleaseRequest) {
+    return false;
+  }
+
+  return scheduleAction(depot->actionManager, prepareForTailBlockCommit,
+                        releaseTailBlockLocks, NULL, NULL);
 }
 
 /**
@@ -215,7 +239,8 @@ static int allocateComponents(SlabDepot          *depot,
   }
 
   result = makeActionManager(depot->zoneCount, getAllocatorThreadID,
-                             getJournalZoneThread(threadConfig), depot, layer,
+                             getJournalZoneThread(threadConfig), depot,
+                             scheduleTailBlockCommit, layer,
                              &depot->actionManager);
   if (result != VDO_SUCCESS) {
     return result;
@@ -226,11 +251,6 @@ static int allocateComponents(SlabDepot          *depot,
   result = makeSlabSummary(layer, summaryPartition, threadConfig,
                            depot->slabSizeShift, depot->slabConfig.dataBlocks,
                            depot->readOnlyNotifier, &depot->slabSummary);
-  if (result != VDO_SUCCESS) {
-    return result;
-  }
-
-  result = makeSlabCompletion(layer, &depot->slabCompletion);
   if (result != VDO_SUCCESS) {
     return result;
   }
@@ -254,7 +274,7 @@ static int allocateComponents(SlabDepot          *depot,
   }
 
   // Allocate slabs.
-  result = allocateSlabs(depot, layer, slabCount);
+  result = allocateSlabs(depot, slabCount);
   if (result != VDO_SUCCESS) {
     return result;
   }
@@ -442,7 +462,6 @@ void freeSlabDepot(SlabDepot **depotPtr)
 
   FREE(depot->slabs);
   freeActionManager(&depot->actionManager);
-  freeSlabCompletion(&depot->slabCompletion);
   freeSlabSummary(&depot->slabSummary);
   destroyEnqueueable(&depot->scrubbingCompletion);
   FREE(depot);
@@ -465,39 +484,50 @@ size_t getSlabDepotEncodedSize(void)
  **/
 static int decodeSlabConfig(Buffer *buffer, SlabConfig *config)
 {
-  int result = getUInt64LEFromBuffer(buffer, &config->slabBlocks);
+  BlockCount count;
+  int result = getUInt64LEFromBuffer(buffer, &count);
   if (result != UDS_SUCCESS) {
     return result;
   }
+  config->slabBlocks = count;
 
-  result = getUInt64LEFromBuffer(buffer, &config->dataBlocks);
+  result = getUInt64LEFromBuffer(buffer, &count);
   if (result != UDS_SUCCESS) {
     return result;
   }
+  config->dataBlocks = count;
 
-  result = getUInt64LEFromBuffer(buffer, &config->referenceCountBlocks);
+  result = getUInt64LEFromBuffer(buffer, &count);
   if (result != UDS_SUCCESS) {
     return result;
   }
+  config->referenceCountBlocks = count;
 
-  result = getUInt64LEFromBuffer(buffer, &config->slabJournalBlocks);
+  result = getUInt64LEFromBuffer(buffer, &count);
   if (result != UDS_SUCCESS) {
     return result;
   }
+  config->slabJournalBlocks = count;
 
-  result
-    = getUInt64LEFromBuffer(buffer, &config->slabJournalFlushingThreshold);
+  result = getUInt64LEFromBuffer(buffer, &count);
   if (result != UDS_SUCCESS) {
     return result;
   }
+  config->slabJournalFlushingThreshold = count;
 
-  result
-    = getUInt64LEFromBuffer(buffer, &config->slabJournalBlockingThreshold);
+  result = getUInt64LEFromBuffer(buffer, &count);
   if (result != UDS_SUCCESS) {
     return result;
   }
+  config->slabJournalBlockingThreshold = count;
 
-  return getUInt64LEFromBuffer(buffer, &config->slabJournalScrubbingThreshold);
+  result = getUInt64LEFromBuffer(buffer, &count);
+  if (result != UDS_SUCCESS) {
+    return result;
+  }
+  config->slabJournalScrubbingThreshold = count;
+
+  return UDS_SUCCESS;
 }
 
 /**
@@ -606,15 +636,19 @@ static int decodeSlabDepotState_2_0(Buffer *buffer, SlabDepotState2_0 *state)
     return result;
   }
 
-  result = getUInt64LEFromBuffer(buffer, &state->firstBlock);
+  PhysicalBlockNumber firstBlock;
+  result = getUInt64LEFromBuffer(buffer, &firstBlock);
   if (result != UDS_SUCCESS) {
     return result;
   }
+  state->firstBlock = firstBlock;
 
-  result = getUInt64LEFromBuffer(buffer, &state->lastBlock);
+  PhysicalBlockNumber lastBlock;
+  result = getUInt64LEFromBuffer(buffer, &lastBlock);
   if (result != UDS_SUCCESS) {
     return result;
   }
+  state->lastBlock = lastBlock;
 
   result = getByte(buffer, &state->zoneCount);
   if (result != UDS_SUCCESS) {
@@ -674,11 +708,11 @@ int decodeSodiumSlabDepot(Buffer              *buffer,
 }
 
 /**********************************************************************/
-int allocateSlabRefCounts(SlabDepot *depot, PhysicalLayer *layer)
+int allocateSlabRefCounts(SlabDepot *depot)
 {
   SlabIterator iterator = getSlabIterator(depot);
   while (hasNextSlab(&iterator)) {
-    int result = allocateRefCountsForSlab(layer, nextSlab(&iterator));
+    int result = allocateRefCountsForSlab(nextSlab(&iterator));
     if (result != VDO_SUCCESS) {
       return result;
     }
@@ -817,114 +851,29 @@ SlabCount getDepotUnrecoveredSlabCount(const SlabDepot *depot)
   return total;
 }
 
-/**********************************************************************/
-static bool abortLoadOnError(VDOCompletion *completion)
-{
-  if (completion->result == VDO_SUCCESS) {
-    return false;
-  }
-
-  SlabDepot *depot = completion->parent;
-  finishCompletion(depot->slabCompletion, completion->result);
-  return true;
-}
-
 /**
- * Finish loading the slab summary and begin loading slabs. This is the
- * callback for the slab summary load registered in loadSlabDepot().
+ * The preamble of a load operation which loads the slab summary.
  *
- * @param summaryCompletion  The SlabSummary load completion
+ * <p>Implements ActionPreamble.
  **/
-static void finishLoadingSummary(VDOCompletion *summaryCompletion)
-{
-  if (abortLoadOnError(summaryCompletion)) {
-    return;
-  }
-
-  SlabDepot *depot = summaryCompletion->parent;
-  loadSlabJournals(depot->slabCompletion, getSlabIterator(depot));
-}
-
-/**********************************************************************/
-void loadSlabDepot(SlabDepot *depot, bool formatDepot, VDOCompletion *parent)
-{
-  int result = allocateSlabRefCounts(depot, parent->layer);
-  if (result != VDO_SUCCESS) {
-    finishCompletion(parent, result);
-    return;
-  }
-
-  if (formatDepot) {
-    loadSlabSummary(depot->slabSummary, depot->oldZoneCount, parent,
-                    finishParentCallback);
-    return;
-  }
-
-  prepareToFinishParent(depot->slabCompletion, parent);
-  loadSlabSummary(depot->slabSummary, depot->oldZoneCount,
-                  depot, finishLoadingSummary);
-}
-
-/**
- * Finish loading the slab summary and begin loading slab journals.
- * This is the callback for the slab summary load registered in
- * loadSlabDepotForRecovery().
- *
- * @param summaryCompletion  The SlabSummary load completion
- **/
-static void loadSlabJournalsForRecovery(VDOCompletion *summaryCompletion)
-{
-  if (abortLoadOnError(summaryCompletion)) {
-    return;
-  }
-
-  SlabDepot *depot = summaryCompletion->parent;
-  loadSlabJournals(depot->slabCompletion, getSlabIterator(depot));
-}
-
-/**********************************************************************/
-void loadSlabDepotForRecovery(SlabDepot *depot, VDOCompletion *parent)
-{
-  prepareToFinishParent(depot->slabCompletion, parent);
-  loadSlabSummary(depot->slabSummary, depot->oldZoneCount, depot,
-                  loadSlabJournalsForRecovery);
-}
-
-/**
- * Finish erasing the slab summary and begin erasing slab journals.
- * This is the callback for the slab summary 'load' registered in
- * loadSlabDepotForRebuild().
- *
- * @param summaryCompletion  The SlabSummary load completion
- **/
-static void eraseSlabJournalsForRebuild(VDOCompletion *summaryCompletion)
-{
-  if (abortLoadOnError(summaryCompletion)) {
-    return;
-  }
-
-  SlabDepot *depot = summaryCompletion->parent;
-  eraseSlabJournals(depot, getSlabIterator(depot), depot->slabCompletion);
-}
-
-/**********************************************************************/
-void loadSlabDepotForRebuild(SlabDepot *depot, VDOCompletion *parent)
-{
-  prepareToFinishParent(depot->slabCompletion, parent);
-  loadSlabSummary(depot->slabSummary, 0, depot, eraseSlabJournalsForRebuild);
-}
-
-/**
- * Check whether another more journal locks must be released. This is the
- * default conclusion for all slab depot actions.
- *
- * <p>Implements ActionConclusion
- **/
-static void concludeAction(void *context)
+static void startDepotLoad(void *context, VDOCompletion *parent)
 {
   SlabDepot *depot = context;
-  if (!hasNextAction(depot->actionManager)) {
-    commitOldestSlabJournalTailBlocks(depot, depot->newReleaseRequest);
+  loadSlabSummary(depot->slabSummary,
+                  getCurrentManagerOperation(depot->actionManager),
+                  depot->oldZoneCount, parent);
+}
+
+/**********************************************************************/
+void loadSlabDepot(SlabDepot      *depot,
+                   AdminStateCode  operation,
+                   VDOCompletion  *parent,
+                   void           *context)
+{
+  if (assertLoadOperation(operation, parent)) {
+    scheduleOperationWithContext(depot->actionManager, operation,
+                                 startDepotLoad, loadBlockAllocator, NULL,
+                                 context, parent);
   }
 }
 
@@ -935,15 +884,8 @@ void prepareToAllocate(SlabDepot         *depot,
 {
   depot->loadType = loadType;
   atomicStore32(&depot->zonesToScrub, depot->zoneCount);
-  scheduleAction(depot->actionManager, prepareAllocatorToAllocate,
-                 concludeAction, parent);
-}
-
-/**********************************************************************/
-void flushDepotSlabJournals(SlabDepot *depot, VDOCompletion *parent)
-{
-  scheduleAction(depot->actionManager, flushAllocatorSlabJournals,
-                 concludeAction, parent);
+  scheduleAction(depot->actionManager, NULL, prepareAllocatorToAllocate,
+                 NULL, parent);
 }
 
 /**********************************************************************/
@@ -953,9 +895,7 @@ void updateSlabDepotSize(SlabDepot *depot, bool reverting)
 }
 
 /**********************************************************************/
-int prepareToGrowSlabDepot(SlabDepot     *depot,
-                           PhysicalLayer *layer,
-                           BlockCount     newSize)
+int prepareToGrowSlabDepot(SlabDepot *depot, BlockCount newSize)
 {
   if ((newSize >> depot->slabSizeShift) <= depot->slabCount) {
     return VDO_INCREMENT_TOO_SMALL;
@@ -982,7 +922,7 @@ int prepareToGrowSlabDepot(SlabDepot     *depot,
   }
 
   abandonNewSlabs(depot);
-  result = allocateSlabs(depot, layer, newSlabCount);
+  result = allocateSlabs(depot, newSlabCount);
   if (result != VDO_SUCCESS) {
     abandonNewSlabs(depot);
     return result;
@@ -999,9 +939,9 @@ int prepareToGrowSlabDepot(SlabDepot     *depot,
  * Finish registering new slabs now that all of the allocators have received
  * their new slabs.
  *
- * <p>Implements ActionConclusion
+ * <p>Implements ActionConclusion.
  **/
-static void finishRegistration(void *context)
+static int finishRegistration(void *context)
 {
   SlabDepot *depot = context;
   depot->slabCount = depot->newSlabCount;
@@ -1009,51 +949,32 @@ static void finishRegistration(void *context)
   depot->slabs        = depot->newSlabs;
   depot->newSlabs     = NULL;
   depot->newSlabCount = 0;
-  concludeAction(context);
+  return VDO_SUCCESS;
 }
 
 /**********************************************************************/
 void useNewSlabs(SlabDepot *depot, VDOCompletion *parent)
 {
   ASSERT_LOG_ONLY(depot->newSlabs != NULL, "Must have new slabs to use");
-  scheduleAction(depot->actionManager, registerNewSlabsForAllocator,
-                 finishRegistration, parent);
+  scheduleOperation(depot->actionManager, ADMIN_STATE_SUSPENDED_OPERATION,
+                    NULL, registerNewSlabsForAllocator, finishRegistration,
+                    parent);
 }
 
 /**********************************************************************/
-void suspendSlabSummary(SlabDepot *depot, VDOCompletion *parent)
+void drainSlabDepot(SlabDepot      *depot,
+                    AdminStateCode  operation,
+                    VDOCompletion  *parent)
 {
-  scheduleAction(depot->actionManager, suspendSummaryZone, concludeAction,
-                 parent);
+  scheduleOperation(depot->actionManager, operation, NULL, drainBlockAllocator,
+                    NULL, parent);
 }
 
 /**********************************************************************/
-void resumeSlabSummary(SlabDepot *depot, VDOCompletion *parent)
+void resumeSlabDepot(SlabDepot *depot, VDOCompletion *parent)
 {
-  scheduleAction(depot->actionManager, resumeSummaryZone, concludeAction,
-                 parent);
-}
-
-/**********************************************************************/
-void saveSlabDepot(SlabDepot *depot, bool close, VDOCompletion *parent)
-{
-  depot->saveRequested = close;
-  scheduleAction(depot->actionManager,
-                 (close
-                  ? closeBlockAllocator : saveBlockAllocatorForFullRebuild),
-                 concludeAction, parent);
-}
-
-/**
- * Conclusion for commiting tail blocks, merely notes that there is no longer
- * an active local release.
- *
- * <p>Implements ActionConclusion
- **/
-static void finishReleasingJournalLocks(void *context)
-{
-  ((SlabDepot *) context)->lockReleaseActive = false;
-  concludeAction(context);
+  scheduleOperation(depot->actionManager, ADMIN_STATE_RESUMING, NULL,
+                    resumeBlockAllocator, NULL, parent);
 }
 
 /**********************************************************************/
@@ -1064,20 +985,8 @@ void commitOldestSlabJournalTailBlocks(SlabDepot      *depot,
     return;
   }
 
-  if (depot->saveRequested) {
-    return;
-  }
-
   depot->newReleaseRequest = recoveryBlockNumber;
-  if (depot->lockReleaseActive
-      || (depot->newReleaseRequest == depot->activeReleaseRequest)) {
-    return;
-  }
-
-  depot->activeReleaseRequest = depot->newReleaseRequest;
-  depot->lockReleaseActive    = true;
-  scheduleAction(depot->actionManager, releaseTailBlockLocks,
-                 finishReleasingJournalLocks, NULL);
+  scheduleTailBlockCommit(depot);
 }
 
 /**********************************************************************/
@@ -1111,8 +1020,8 @@ void scrubAllUnrecoveredSlabs(SlabDepot     *depot,
 {
   prepareCompletion(&depot->scrubbingCompletion, callback, errorHandler,
                     threadID, parent);
-  scheduleAction(depot->actionManager, scrubAllUnrecoveredSlabsInZone,
-                 concludeAction, launchParent);
+  scheduleAction(depot->actionManager, NULL, scrubAllUnrecoveredSlabsInZone,
+                 NULL, launchParent);
 }
 
 /**********************************************************************/

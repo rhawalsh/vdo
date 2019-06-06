@@ -50,12 +50,12 @@ typedef struct {
 } __attribute__((packed)) BlockMapState2_0;
 
 static const Header BLOCK_MAP_HEADER_2_0 = {
-  .id                                    = BLOCK_MAP,
-  .version                               = {
-    .majorVersion                        = 2,
-    .minorVersion                        = 0,
+  .id               = BLOCK_MAP,
+  .version          = {
+    .majorVersion   = 2,
+    .minorVersion   = 0,
   },
-  .size                                  = sizeof(BlockMapState2_0),
+  .size             = sizeof(BlockMapState2_0),
 };
 
 /**
@@ -70,7 +70,7 @@ typedef struct {
    * the reference on the old value must be released and a reference on the
    * new value must be acquired.
    **/
-  SequenceNumber                                                    recoveryLock;
+  SequenceNumber recoveryLock;
 } BlockMapPageContext;
 
 /**
@@ -181,27 +181,37 @@ static int decodeBlockMapState_2_0(Buffer *buffer, BlockMapState2_0 *state)
 {
   size_t initialLength = contentLength(buffer);
 
-  int result = getUInt64LEFromBuffer(buffer, &state->flatPageOrigin);
+  PhysicalBlockNumber flatPageOrigin;
+  int result = getUInt64LEFromBuffer(buffer, &flatPageOrigin);
   if (result != UDS_SUCCESS) {
     return result;
   }
 
-  result = getUInt64LEFromBuffer(buffer, &state->flatPageCount);
+  BlockCount flatPageCount;
+  result = getUInt64LEFromBuffer(buffer, &flatPageCount);
   if (result != UDS_SUCCESS) {
     return result;
   }
 
-  result = getUInt64LEFromBuffer(buffer, &state->rootOrigin);
+  PhysicalBlockNumber rootOrigin;
+  result = getUInt64LEFromBuffer(buffer, &rootOrigin);
   if (result != UDS_SUCCESS) {
     return result;
   }
 
-  result = getUInt64LEFromBuffer(buffer, &state->rootCount);
+  BlockCount rootCount;
+  result = getUInt64LEFromBuffer(buffer, &rootCount);
   if (result != UDS_SUCCESS) {
     return result;
   }
 
-  size_t decodedSize                       = initialLength - contentLength(buffer);
+  *state = (BlockMapState2_0) {
+    .flatPageOrigin = flatPageOrigin,
+    .flatPageCount  = flatPageCount,
+    .rootOrigin     = rootOrigin,
+    .rootCount      = rootCount,
+  };
+  size_t decodedSize = initialLength - contentLength(buffer);
   return ASSERT(BLOCK_MAP_HEADER_2_0.size == decodedSize,
                 "decoded block map component size must match header size");
 }
@@ -407,7 +417,7 @@ int encodeBlockMap(const BlockMap *map, Buffer *buffer)
     return result;
   }
 
-  size_t encodedSize                       = contentLength(buffer) - initialLength;
+  size_t encodedSize = contentLength(buffer) - initialLength;
   return ASSERT(BLOCK_MAP_HEADER_2_0.size == encodedSize,
                 "encoded block map component size must match header size");
 }

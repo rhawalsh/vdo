@@ -106,14 +106,12 @@ int encodeVersionNumber(VersionNumber version, Buffer *buffer)
 /**********************************************************************/
 int decodeHeader(Buffer *buffer, Header *header)
 {
-  ComponentID id;
-  int result = getUInt32LEFromBuffer(buffer, &id);
+  int result = getUInt32LEFromBuffer(buffer, &header->id);
   if (result != UDS_SUCCESS) {
     return result;
   }
 
-  VersionNumber version;
-  result = decodeVersionNumber(buffer, &version);
+  result = decodeVersionNumber(buffer, &header->version);
   if (result != UDS_SUCCESS) {
     return result;
   }
@@ -124,23 +122,17 @@ int decodeHeader(Buffer *buffer, Header *header)
     return result;
   }
 
-  *header = (Header) {
-    .id      = id,
-    .version = version,
-    .size    = size,
-  };
+  header->size = size;
   return UDS_SUCCESS;
 }
 
 /**********************************************************************/
 int decodeVersionNumber(Buffer *buffer, VersionNumber *version)
 {
-  PackedVersionNumber packed;
-  int result = getBytesFromBuffer(buffer, sizeof(packed), &packed);
+  int result = getUInt32LEFromBuffer(buffer, &version->majorVersion);
   if (result != UDS_SUCCESS) {
     return result;
   }
 
-  *version = unpackVersionNumber(packed);
-  return UDS_SUCCESS;
+  return getUInt32LEFromBuffer(buffer, &version->minorVersion);
 }

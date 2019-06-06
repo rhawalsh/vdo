@@ -61,7 +61,6 @@ static const byte MAGIC_NUMBER[MAGIC_NUMBER_SIZE + 1] = "dmvdo001";
 
 static const ReleaseVersionNumber COMPATIBLE_RELEASE_VERSIONS[] = {
   MAGNESIUM_RELEASE_VERSION_NUMBER,
-  ALUMINUM_RELEASE_VERSION_NUMBER,
 };
 
 /**
@@ -97,30 +96,17 @@ static inline bool isLoadableReleaseVersion(ReleaseVersionNumber version)
  **/
 static int decodeIndexConfig(Buffer *buffer, IndexConfig *config)
 {
-  uint32_t mem;
-  int result = getUInt32LEFromBuffer(buffer, &mem);
+  int result = getUInt32LEFromBuffer(buffer, &config->mem);
   if (result != VDO_SUCCESS) {
     return result;
   }
 
-  uint32_t checkpointFrequency;
-  result = getUInt32LEFromBuffer(buffer, &checkpointFrequency);
+  result = getUInt32LEFromBuffer(buffer, &config->checkpointFrequency);
   if (result != VDO_SUCCESS) {
     return result;
   }
 
-  bool sparse;
-  result = getBoolean(buffer, &sparse);
-  if (result != VDO_SUCCESS) {
-    return result;
-  }
-
-  *config = (IndexConfig) {
-    .mem                 = mem,
-    .checkpointFrequency = checkpointFrequency,
-    .sparse              = sparse,
-  };
-  return VDO_SUCCESS;
+  return getBoolean(buffer, &config->sparse);
 }
 
 /**
@@ -156,23 +142,12 @@ static int encodeIndexConfig(const IndexConfig *config, Buffer *buffer)
  **/
 static int decodeVolumeRegion(Buffer *buffer, VolumeRegion *region)
 {
-  VolumeRegionID id;
-  int result = getUInt32LEFromBuffer(buffer, &id);
+  int result = getUInt32LEFromBuffer(buffer, &region->id);
   if (result != VDO_SUCCESS) {
     return result;
   }
 
-  PhysicalBlockNumber startBlock;
-  result = getUInt64LEFromBuffer(buffer, &startBlock);
-  if (result != VDO_SUCCESS) {
-    return result;
-  }
-
-  *region = (VolumeRegion) {
-    .id         = id,
-    .startBlock = startBlock,
-  };
-  return VDO_SUCCESS;
+  return getUInt64LEFromBuffer(buffer, &region->startBlock);
 }
 
 /**
@@ -203,20 +178,15 @@ static int encodeVolumeRegion(const VolumeRegion *region, Buffer *buffer)
  **/
 static int decodeVolumeGeometry(Buffer *buffer, VolumeGeometry *geometry)
 {
-  ReleaseVersionNumber releaseVersion;
-  int result = getUInt32LEFromBuffer(buffer, &releaseVersion);
+  int result = getUInt32LEFromBuffer(buffer, &geometry->releaseVersion);
   if (result != VDO_SUCCESS) {
     return result;
   }
 
-  Nonce nonce;
-  result = getUInt64LEFromBuffer(buffer, &nonce);
+  result = getUInt64LEFromBuffer(buffer, &geometry->nonce);
   if (result != VDO_SUCCESS) {
     return result;
   }
-
-  geometry->releaseVersion = releaseVersion;
-  geometry->nonce          = nonce;
 
   result = getBytesFromBuffer(buffer, sizeof(UUID), geometry->uuid);
   if (result != VDO_SUCCESS) {
@@ -441,8 +411,8 @@ int computeIndexBlocks(IndexConfig *indexConfig, BlockCount *indexBlocksPtr)
 
   BlockCount indexBlocks = indexBytes / VDO_BLOCK_SIZE;
   if ((((uint64_t) indexBlocks) * VDO_BLOCK_SIZE) != indexBytes) {
-    return logErrorWithStringError(VDO_PARAMETER_MISMATCH, "index size must be"
-                                   " a multiple of block size %d",
+    return logErrorWithStringError(VDO_PARAMETER_MISMATCH, "index size must be a"
+                                   " multiple of block size %d",
                                    VDO_BLOCK_SIZE);
   }
 

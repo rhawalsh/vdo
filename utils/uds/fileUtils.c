@@ -157,7 +157,7 @@ int syncAndCloseFile(int fd, const char *errorMessage)
 /**********************************************************************/
 void trySyncAndCloseFile(int fd)
 {
-  int result = syncAndCloseFile(fd, NULL);
+  int result = syncAndCloseFile(fd, __func__);
   if (result != UDS_SUCCESS) {
     logDebugWithStringError(result, "error syncing and closing file");
   }

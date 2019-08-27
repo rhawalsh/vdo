@@ -22,6 +22,7 @@ ExcludeArch: ppc64
 ExcludeArch: ppc64le
 ExcludeArch: aarch64
 ExcludeArch: i686
+BuildRequires: device-mapper-devel
 BuildRequires: device-mapper-event-devel
 BuildRequires: gcc
 BuildRequires: libuuid-devel
@@ -139,5 +140,8 @@ make install DESTDIR=$RPM_BUILD_ROOT INSTALLOWNER= bindir=%{_bindir} \
 %{_sysconfdir}/bash_completion.d/vdostats
 
 %changelog
+* Tue Aug 27 2019 - Andy Walsh <awalsh@redhat.com> - 6.2.1.134-2
+- Added build dependency for device-mapper-devel
+
 * Thu Aug 01 2019 - J. corwin Coburn <corwin@redhat.com> - 6.2.1.134-1
 HASH(0x1f5b000)

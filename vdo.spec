@@ -1,4 +1,4 @@
-%define spec_release 1
+%define spec_release 2
 #
 #
 #

@@ -25,6 +25,7 @@ ExcludeArch: i686
 BuildRequires: device-mapper-devel
 BuildRequires: device-mapper-event-devel
 BuildRequires: gcc
+BuildRequires: libblkid-devel
 BuildRequires: libuuid-devel
 BuildRequires: make
 BuildRequires: python3

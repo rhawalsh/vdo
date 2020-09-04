@@ -289,13 +289,14 @@ static int checkForSignaturesUsingBlkid(const char *filename, bool force)
   blkid_probe_set_partitions_flags(probe, BLKID_PARTS_MAGIC);
 
   blkid_probe_enable_superblocks(probe, 1);
-  blkid_probe_set_superblocks_flags(probe, BLKID_SUBLKS_LABEL |
-				    BLKID_SUBLKS_UUID |
-				    BLKID_SUBLKS_TYPE |
-				    BLKID_SUBLKS_USAGE |
-				    BLKID_SUBLKS_VERSION |
-				    BLKID_SUBLKS_MAGIC |
-				    BLKID_SUBLKS_BADCSUM);
+  int flags = BLKID_SUBLKS_DEFAULT | BLKID_SUBLKS_USAGE | BLKID_SUBLKS_VERSION
+    | BLKID_SUBLKS_MAGIC;
+
+#ifdef BLKID_SUBLKS_BADCSUM
+  flags |= BLKID_SUBLKS_BADCSUM;
+#endif
+
+  blkid_probe_set_superblocks_flags(probe, flags);
 
   Buffer *buffer = NULL;
   result = makeBuffer(0, &buffer);

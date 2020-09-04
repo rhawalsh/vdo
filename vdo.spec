@@ -1,4 +1,4 @@
-%define spec_release 1
+%define spec_release 2
 #
 #
 #
@@ -179,5 +179,8 @@ This package provides the user-space support tools for VDO.
 %{_mandir}/man8/vdoregenerategeometry.8.gz
 
 %changelog
+* Fri Sep 04 2020 - Andy Walsh <awalsh@redhat.com> - 6.2.3.114-2
+- Updated to build with older versions of blkid.
+
 * Thu Jul 30 2020 - J. corwin Coburn <corwin@redhat.com> - 6.2.3.114-1
 HASH(0x14d09e8)

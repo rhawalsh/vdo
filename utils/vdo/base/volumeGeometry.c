@@ -236,14 +236,14 @@ static int decodeVolumeGeometry(Buffer         *buffer,
     return result;
   }
 
-  if (version <= 4) {
-    geometry->bioOffset = 0;
-  } else {
-    result = getUInt64LEFromBuffer(buffer, &geometry->bioOffset);
+  BlockCount bioOffset = 0;
+  if (version > 4) {
+    result = getUInt64LEFromBuffer(buffer, &bioOffset);
     if (result != VDO_SUCCESS) {
       return result;
     }
   }
+  geometry->bioOffset = bioOffset;
 
   for (VolumeRegionID id = 0; id < VOLUME_REGION_COUNT; id++) {
     result = decodeVolumeRegion(buffer, &geometry->regions[id]);
